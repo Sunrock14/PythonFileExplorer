@@ -1,0 +1,315 @@
+import os
+import sys
+import fnmatch
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                             QHBoxLayout, QLineEdit, QPushButton, QListWidget, 
+                             QLabel, QComboBox, QFileDialog, QMessageBox, 
+                             QProgressBar, QStatusBar)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
+from PyQt5.QtGui import QIcon
+import time
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+class FileScanner(QThread):
+    """Dosyaları arkaplanda tarayan sınıf"""
+    update_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(list)
+    progress_signal = pyqtSignal(int)
+    
+    def __init__(self, path, file_extensions=None):
+        super().__init__()
+        self.path = path
+        self.file_extensions = file_extensions
+        self.files = []
+        self.running = True
+        
+    def run(self):
+        self.scan_files()
+        
+    def scan_files(self):
+        self.files = []
+        total_items = 0
+        scanned_items = 0
+        
+        # Önce toplam dosya sayısını bulalım (ilerleme çubuğu için)
+        for root, _, files in os.walk(self.path):
+            total_items += len(files)
+        
+        # Dosyaları tarayalım
+        for root, _, files in os.walk(self.path):
+            if not self.running:
+                break
+                
+            for file in files:
+                if not self.running:
+                    break
+                
+                file_path = os.path.join(root, file)
+                
+                # Eğer uzantı filtresi varsa kontrol et
+                if self.file_extensions:
+                    if any(file.lower().endswith(ext.lower()) for ext in self.file_extensions):
+                        self.files.append(file_path)
+                        self.update_signal.emit(file_path)
+                else:
+                    self.files.append(file_path)
+                    self.update_signal.emit(file_path)
+                
+                scanned_items += 1
+                progress = int((scanned_items / total_items) * 100) if total_items > 0 else 0
+                self.progress_signal.emit(progress)
+                time.sleep(0.001)  # CPU kullanımını azaltmak için
+                
+        self.finished_signal.emit(self.files)
+    
+    def stop(self):
+        self.running = False
+
+
+class FileSystemWatcher(FileSystemEventHandler):
+    """Dosya sistemi değişikliklerini izleyen sınıf"""
+    
+    def __init__(self, app):
+        self.app = app
+        
+    def on_created(self, event):
+        if not event.is_directory:
+            self.app.handle_file_change(event.src_path, "added")
+    
+    def on_deleted(self, event):
+        if not event.is_directory:
+            self.app.handle_file_change(event.src_path, "deleted")
+    
+    def on_modified(self, event):
+        if not event.is_directory:
+            self.app.handle_file_change(event.src_path, "modified")
+    
+    def on_moved(self, event):
+        if not event.is_directory:
+            self.app.handle_file_change(event.dest_path, "moved")
+
+
+class FileExplorer(QMainWindow):
+    """Ana uygulama penceresi"""
+    
+    def __init__(self):
+        super().__init__()
+        self.scanner = None
+        self.observer = None
+        self.watch_paths = []
+        self.all_files = []
+        self.filtered_files = []
+        self.init_ui()
+        
+    def init_ui(self):
+        # Ana pencere ayarları
+        self.setWindowTitle("Dosya Tarayıcı")
+        self.setGeometry(100, 100, 800, 600)
+        
+        # Ana widget
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        
+        # Üst panel - Klasör seçme
+        top_panel = QHBoxLayout()
+        self.path_input = QLineEdit()
+        self.path_input.setPlaceholderText("Taranacak klasör yolu")
+        browse_button = QPushButton("Gözat")
+        browse_button.clicked.connect(self.browse_folder)
+        scan_button = QPushButton("Tara")
+        scan_button.clicked.connect(self.start_scan)
+        
+        top_panel.addWidget(self.path_input)
+        top_panel.addWidget(browse_button)
+        top_panel.addWidget(scan_button)
+        
+        # Orta panel - Arama ve filtreleme
+        middle_panel = QHBoxLayout()
+        
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Ara...")
+        self.search_input.textChanged.connect(self.filter_files)
+        
+        self.extension_combo = QComboBox()
+        self.extension_combo.addItem("Tüm Dosyalar")
+        common_extensions = ["txt", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", 
+                           "jpg", "jpeg", "png", "gif", "mp3", "mp4", "zip", "rar", "py", "exe"]
+        
+        for ext in common_extensions:
+            self.extension_combo.addItem(f".{ext}")
+        
+        self.extension_combo.currentTextChanged.connect(self.filter_files)
+        
+        middle_panel.addWidget(QLabel("Arama:"))
+        middle_panel.addWidget(self.search_input)
+        middle_panel.addWidget(QLabel("Uzantı:"))
+        middle_panel.addWidget(self.extension_combo)
+        
+        # Dosya listesi
+        self.file_list = QListWidget()
+        self.file_list.itemDoubleClicked.connect(self.open_file)
+        
+        # İlerleme çubuğu
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        
+        # Durum çubuğu
+        self.statusBar = QStatusBar()
+        self.setStatusBar(self.statusBar)
+        self.statusBar.showMessage("Hazır")
+        
+        # Ana düzene widget'ları ekleme
+        main_layout.addLayout(top_panel)
+        main_layout.addLayout(middle_panel)
+        main_layout.addWidget(self.file_list)
+        main_layout.addWidget(self.progress_bar)
+        
+    def browse_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Klasör Seç")
+        if folder:
+            self.path_input.setText(folder)
+    
+    def start_scan(self):
+        path = self.path_input.text()
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(self, "Hata", "Lütfen geçerli bir klasör yolu girin.")
+            return
+        
+        # Önceki taramayı durdur
+        if self.scanner and self.scanner.isRunning():
+            self.scanner.stop()
+            self.scanner.wait()
+        
+        # Önceki izleyiciyi durdur
+        if self.observer:
+            self.observer.stop()
+            self.observer.join()
+        
+        # Dosya listesini temizle
+        self.file_list.clear()
+        self.all_files = []
+        self.filtered_files = []
+        
+        # İlerleme çubuğunu görünür hale getir
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        
+        # Uzantı filtresi
+        extension_filter = None
+        selected_extension = self.extension_combo.currentText()
+        if selected_extension != "Tüm Dosyalar":
+            extension_filter = [selected_extension]
+        
+        # Yeni taramayı başlat
+        self.scanner = FileScanner(path, extension_filter)
+        self.scanner.update_signal.connect(self.update_file_list)
+        self.scanner.finished_signal.connect(self.scan_finished)
+        self.scanner.progress_signal.connect(self.update_progress)
+        self.scanner.start()
+        
+        # Dosya sistemi izleyicisini başlat
+        self.start_file_watcher(path)
+        
+        self.statusBar.showMessage(f"Taranıyor: {path}")
+    
+    def update_file_list(self, file_path):
+        self.all_files.append(file_path)
+        # Eğer filtreleme yoksa veya dosya filtreye uyuyorsa listeye ekle
+        if self.should_display_file(file_path):
+            self.filtered_files.append(file_path)
+            self.file_list.addItem(os.path.basename(file_path))
+    
+    def scan_finished(self, files):
+        self.progress_bar.setVisible(False)
+        self.all_files = files
+        self.filter_files()
+        self.statusBar.showMessage(f"Tarama tamamlandı. {len(files)} dosya bulundu.")
+    
+    def update_progress(self, value):
+        self.progress_bar.setValue(value)
+    
+    def filter_files(self):
+        search_text = self.search_input.text().lower()
+        extension = self.extension_combo.currentText()
+        
+        self.file_list.clear()
+        self.filtered_files = []
+        
+        for file_path in self.all_files:
+            if self.should_display_file(file_path, search_text, extension):
+                self.filtered_files.append(file_path)
+                self.file_list.addItem(os.path.basename(file_path))
+        
+        self.statusBar.showMessage(f"{len(self.filtered_files)} dosya gösteriliyor")
+    
+    def should_display_file(self, file_path, search_text="", extension=""):
+        file_name = os.path.basename(file_path).lower()
+        
+        # Arama metnine göre filtrele
+        if search_text and search_text not in file_name:
+            return False
+        
+        # Uzantıya göre filtrele
+        if extension and extension != "Tüm Dosyalar":
+            if not file_name.endswith(extension.lower()):
+                return False
+        
+        return True
+    
+    def open_file(self, item):
+        index = self.file_list.row(item)
+        if index >= 0 and index < len(self.filtered_files):
+            file_path = self.filtered_files[index]
+            try:
+                # Windows işletim sistemi için dosyayı açma
+                os.startfile(file_path)
+            except Exception as e:
+                QMessageBox.warning(self, "Hata", f"Dosya açılamadı: {str(e)}")
+    
+    def start_file_watcher(self, path):
+        # Dosya sistemi izleyicisini başlat
+        self.observer = Observer()
+        event_handler = FileSystemWatcher(self)
+        self.observer.schedule(event_handler, path, recursive=True)
+        self.observer.start()
+        self.watch_paths.append(path)
+        
+    def handle_file_change(self, file_path, change_type):
+        # Dosya sisteminde değişiklik olduğunda yapılacaklar
+        if change_type == "added":
+            if file_path not in self.all_files:
+                self.all_files.append(file_path)
+                if self.should_display_file(file_path):
+                    self.filtered_files.append(file_path)
+                    self.file_list.addItem(os.path.basename(file_path))
+        
+        elif change_type == "deleted":
+            if file_path in self.all_files:
+                self.all_files.remove(file_path)
+                if file_path in self.filtered_files:
+                    self.filtered_files.remove(file_path)
+                    self.filter_files()  # Listeyi yeniden oluştur
+        
+        elif change_type in ["modified", "moved"]:
+            self.filter_files()  # Listeyi yeniden oluştur
+    
+    def closeEvent(self, event):
+        # Uygulamadan çıkmadan önce izleyiciyi ve tarayıcıyı durdur
+        if self.scanner and self.scanner.isRunning():
+            self.scanner.stop()
+            self.scanner.wait()
+        
+        if self.observer:
+            self.observer.stop()
+            self.observer.join()
+        
+        super().closeEvent(event)
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    ex = FileExplorer()
+    ex.show()
+    sys.exit(app.exec_()) 
